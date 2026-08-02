@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# JIT-compiled CUDA/C++ extension artifacts
+fitter/rspmm/*.so
+fitter/rspmm/build/
+
+# Runs / outputs
+output/
+log.txt
+*.log
+model_epoch_*.pth
+
+# Editors
+.idea/
+.vscode/
+
+# Processed dataset caches (keep raw/ only)
+kg-datasets/**/processed/
