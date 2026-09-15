@@ -606,108 +606,170 @@ class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
 
 
 class MsgAwareForecastDataset(TransductiveTemporalForecastDataset):
-    """Forecast dataset that also consumes msg.txt as base MP context.
+    """Fully-inductive temporal KG dataset with DISJOINT G_tr / G_inf vocabs.
 
-    For the IndT sweep variants (TTRIX-built WIKIIndT_*, GDELTIndT_*,
-    ICEWS*IndT_*) which ship a msg.txt of pre-split history quadruples
-    alongside train/valid/test. The MP graph for each split is built
-    cumulatively:
+    Direct port of TTRIX's InductiveTemporalDatasetINGRAM
+    (src/trix/datasets.py:1989). For the IndT sweep variants
+    (WIKIIndT_*, GDELTIndT_*, ICEWS*IndT_*) with INGRAM's 4-file layout:
 
-        train_data.edge_index = msg
-        valid_data.edge_index = msg + train
-        test_data.edge_index  = msg + train + valid  (bidirectional)
+        train.txt -- G_tr training quadruples
+        msg.txt   -- G_inf observed graph (disjoint vocab from G_tr)
+        valid.txt -- G_tr held-out validation queries (transductive valid)
+        test.txt  -- G_inf inductive test queries
 
-    Targets are per-split as usual. Falls back to
-    TransductiveTemporalForecastDataset behavior at process time if
-    msg.txt is missing.
+    Per-split Data:
+        train_data: edge_index = train.txt bidirectional (G_tr vocab)
+                    target_* = train.txt
+                    num_nodes = |G_tr|,  num_relations = num_train_rels*2
+        valid_data: edge_index = train.txt bidirectional (G_tr vocab)
+                    target_* = valid.txt
+                    num_nodes = |G_tr|,  num_relations = num_train_rels*2
+        test_data:  edge_index = msg.txt bidirectional (G_inf vocab, disjoint)
+                    target_* = test.txt
+                    num_nodes = |G_inf|, num_relations = num_inf_rels*2
+
+    Time offsets: shared min-date across all four files, so time_type
+    values live in a common absolute-time index space even though the
+    entity/relation vocabularies are disjoint.
     """
 
     @property
     def raw_file_names(self):
-        return ["train.txt", "valid.txt", "test.txt", "msg.txt"]
+        # Match TTRIX order at src/trix/datasets.py:2141.
+        return ["train.txt", "msg.txt", "valid.txt", "test.txt"]
 
     @property
     def processed_dir(self):
-        # Different data shape from parent (msg.txt included) -> separate cache.
+        # Fully-inductive shape -> distinct cache from parent forecast class.
         return os.path.join(self.root, self.name, "processed_forecast_msg")
 
+    def _parse_date(self, s):
+        """Return integer ordinal for a timestamp string.
+
+        Default: try int (handles zero-padded integer strings like WIKI's
+        "092"), fall back to ISO date parsing (GDELT-style "2018-07-31").
+        Subclasses override for other formats.
+        """
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            from datetime import datetime
+            return int(datetime.strptime(s, "%Y-%m-%d").toordinal())
+
+    def _load_indt_file(self, path, ent_vocab=None, rel_vocab=None):
+        """Load a 4-column (h r t date) file. Returns triplets + raw timestamps."""
+        ent_vocab = dict(ent_vocab) if ent_vocab else {}
+        rel_vocab = dict(rel_vocab) if rel_vocab else {}
+        ec, rc = len(ent_vocab), len(rel_vocab)
+        triplets, timestamps = [], []
+        with open(path, "r", encoding="utf-8") as fin:
+            for line in fin:
+                parts = line.rstrip("\n").split(self.delimiter)
+                if len(parts) < 4:
+                    continue
+                u, r, v, ts = parts[0], parts[1], parts[2], parts[3]
+                if u not in ent_vocab:
+                    ent_vocab[u] = ec; ec += 1
+                if v not in ent_vocab:
+                    ent_vocab[v] = ec; ec += 1
+                if r not in rel_vocab:
+                    rel_vocab[r] = rc; rc += 1
+                triplets.append((ent_vocab[u], ent_vocab[v], rel_vocab[r]))
+                timestamps.append(ts)
+        return {
+            "triplets": triplets,
+            "timestamps": timestamps,
+            "num_node": len(ent_vocab),
+            "num_relation": len(rel_vocab),
+            "inv_entity_vocab": ent_vocab,
+            "inv_rel_vocab": rel_vocab,
+        }
+
     def process(self):
-        msg_path = self.raw_paths[3]
+        train_path, msg_path, valid_path, test_path = self.raw_paths[:4]
+
         if not os.path.exists(msg_path):
-            # Graceful fallback: no msg.txt -> behave like parent class.
+            # No msg.txt -> degrade to parent class (train+valid MP prefix).
             super().process()
             return
 
-        # Load msg first so its vocab is included before splits push more.
-        msg_results = self.load_file(msg_path, inv_entity_vocab={}, inv_rel_vocab={}, inv_time_vocab={})
-        train_results = self.load_file(self.raw_paths[0],
-                                       msg_results["inv_entity_vocab"], msg_results["inv_rel_vocab"], msg_results['inv_time_vocab'])
-        valid_results = self.load_file(self.raw_paths[1],
-                                       train_results["inv_entity_vocab"], train_results["inv_rel_vocab"], train_results['inv_time_vocab'])
-        test_results = self.load_file(self.raw_paths[2],
-                                      valid_results["inv_entity_vocab"], valid_results["inv_rel_vocab"], valid_results['inv_time_vocab'])
-
-        num_node = test_results["num_node"]
-        num_relations = test_results["num_relation"]
-        num_time = test_results["num_time"]
-
-        _, (msg_quadruples, train_quadruples, valid_quadruples, test_quadruples) = self._remap_time_vocab(
-            test_results["inv_time_vocab"],
-            msg_results["quadruples"],
-            train_results["quadruples"],
-            valid_results["quadruples"],
-            test_results["quadruples"],
+        # G_tr: train.txt fresh; valid.txt extends the same vocab
+        train_res = self._load_indt_file(train_path)
+        valid_res = self._load_indt_file(
+            valid_path,
+            ent_vocab=train_res["inv_entity_vocab"],
+            rel_vocab=train_res["inv_rel_vocab"],
+        )
+        # G_inf: msg.txt fresh (DISJOINT from G_tr); test.txt extends it
+        inf_res = self._load_indt_file(msg_path)
+        test_res = self._load_indt_file(
+            test_path,
+            ent_vocab=inf_res["inv_entity_vocab"],
+            rel_vocab=inf_res["inv_rel_vocab"],
         )
 
-        def _quads_to_tensors(quads):
-            if not quads:
-                empty2 = torch.empty(2, 0, dtype=torch.long)
-                empty1 = torch.empty(0, dtype=torch.long)
-                return empty2, empty1, empty1
-            ei = torch.tensor([[q[0], q[1]] for q in quads], dtype=torch.long).t()
-            et = torch.tensor([q[2] for q in quads], dtype=torch.long)
-            tt = torch.tensor([q[3] for q in quads], dtype=torch.long)
-            return ei, et, tt
+        num_train_nodes = valid_res["num_node"]
+        num_train_rels = valid_res["num_relation"]
+        num_inf_nodes = test_res["num_node"]
+        num_inf_rels = test_res["num_relation"]
 
-        msg_ei, msg_et, msg_tt = _quads_to_tensors(msg_quadruples)
-        tr_ei, tr_et, tr_tt = _quads_to_tensors(train_quadruples)
-        va_ei, va_et, va_tt = _quads_to_tensors(valid_quadruples)
-        te_ei, te_et, te_tt = _quads_to_tensors(test_quadruples)
+        # Shared min-date offset across all four files -> aligned time axis.
+        all_dates = (train_res["timestamps"] + valid_res["timestamps"]
+                     + inf_res["timestamps"] + test_res["timestamps"])
+        parsed = [self._parse_date(d) for d in all_dates]
+        min_ord = min(parsed)
+        max_ord = max(parsed)
+        num_time = int(max_ord - min_ord + 1)
 
-        def _bi(ei, et, tt):
-            ei_bi = torch.cat([ei, ei.flip(0)], dim=1)
-            et_bi = torch.cat([et, et + num_relations])
-            tt_bi = torch.cat([tt, tt])
-            return ei_bi, et_bi, tt_bi
+        def to_t(stamps):
+            return torch.tensor([self._parse_date(d) - min_ord for d in stamps], dtype=torch.long)
 
-        # Cumulative MP graphs
-        msg_ei_fwd = msg_ei
-        msg_et_fwd = msg_et
-        msg_tt_fwd = msg_tt
-        msg_ei_bi, msg_et_bi, msg_tt_bi = _bi(msg_ei_fwd, msg_et_fwd, msg_tt_fwd)
+        train_t = to_t(train_res["timestamps"])
+        valid_t = to_t(valid_res["timestamps"])
+        inf_t = to_t(inf_res["timestamps"])
+        test_t = to_t(test_res["timestamps"])
 
-        msg_tr_ei_fwd = torch.cat([msg_ei_fwd, tr_ei], dim=1)
-        msg_tr_et_fwd = torch.cat([msg_et_fwd, tr_et])
-        msg_tr_tt_fwd = torch.cat([msg_tt_fwd, tr_tt])
-        msg_tr_ei_bi, msg_tr_et_bi, msg_tr_tt_bi = _bi(msg_tr_ei_fwd, msg_tr_et_fwd, msg_tr_tt_fwd)
+        # G_tr message-passing graph = train.txt bidirectional
+        train_target_edges = torch.tensor([[t[0], t[1]] for t in train_res["triplets"]], dtype=torch.long).t()
+        train_target_etypes = torch.tensor([t[2] for t in train_res["triplets"]])
+        train_fact_index = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
+        train_fact_type = torch.cat([train_target_etypes, train_target_etypes + num_train_rels])
+        train_fact_time = torch.cat([train_t, train_t])
 
-        msg_tr_va_ei_fwd = torch.cat([msg_tr_ei_fwd, va_ei], dim=1)
-        msg_tr_va_et_fwd = torch.cat([msg_tr_et_fwd, va_et])
-        msg_tr_va_tt_fwd = torch.cat([msg_tr_tt_fwd, va_tt])
-        msg_tr_va_ei_bi, msg_tr_va_et_bi, msg_tr_va_tt_bi = _bi(msg_tr_va_ei_fwd, msg_tr_va_et_fwd, msg_tr_va_tt_fwd)
+        # G_inf message-passing graph = msg.txt bidirectional (disjoint IDs)
+        inf_edge_index = torch.tensor([[t[0], t[1]] for t in inf_res["triplets"]], dtype=torch.long).t()
+        inf_edge_index_bi = torch.cat([inf_edge_index, inf_edge_index.flip(0)], dim=1)
+        inf_etypes = torch.tensor([t[2] for t in inf_res["triplets"]])
+        inf_etypes_bi = torch.cat([inf_etypes, inf_etypes + num_inf_rels])
+        inf_time_bi = torch.cat([inf_t, inf_t])
 
-        train_data = Data(edge_index=msg_ei_bi, edge_type=msg_et_bi, num_nodes=num_node,
-                          target_edge_index=tr_ei, target_edge_type=tr_et,
-                          num_relations=num_relations * 2, num_time=num_time,
-                          time_type=msg_tt_bi, target_time_type=tr_tt)
-        valid_data = Data(edge_index=msg_tr_ei_bi, edge_type=msg_tr_et_bi, num_nodes=num_node,
-                          target_edge_index=va_ei, target_edge_type=va_et,
-                          num_relations=num_relations * 2, num_time=num_time,
-                          time_type=msg_tr_tt_bi, target_time_type=va_tt)
-        test_data = Data(edge_index=msg_tr_va_ei_bi, edge_type=msg_tr_va_et_bi, num_nodes=num_node,
-                         target_edge_index=te_ei, target_edge_type=te_et,
-                         num_relations=num_relations * 2, num_time=num_time,
-                         time_type=msg_tr_va_tt_bi, target_time_type=te_tt)
+        valid_q = torch.tensor(valid_res["triplets"], dtype=torch.long)  # (n, 3) as (h, t, r)
+        test_q = torch.tensor(test_res["triplets"], dtype=torch.long)
+
+        # Wrap num_time so InMemoryDataset.collate preserves it as an attribute.
+        num_time_t = torch.tensor([num_time])
+
+        train_data = Data(
+            edge_index=train_fact_index, edge_type=train_fact_type,
+            num_nodes=num_train_nodes,
+            target_edge_index=train_target_edges, target_edge_type=train_target_etypes,
+            num_relations=num_train_rels * 2, num_time=num_time_t,
+            time_type=train_fact_time, target_time_type=train_t,
+        )
+        valid_data = Data(
+            edge_index=train_fact_index, edge_type=train_fact_type,
+            num_nodes=num_train_nodes,
+            target_edge_index=valid_q[:, :2].T, target_edge_type=valid_q[:, 2],
+            num_relations=num_train_rels * 2, num_time=num_time_t,
+            time_type=train_fact_time, target_time_type=valid_t,
+        )
+        test_data = Data(
+            edge_index=inf_edge_index_bi, edge_type=inf_etypes_bi,
+            num_nodes=num_inf_nodes,
+            target_edge_index=test_q[:, :2].T, target_edge_type=test_q[:, 2],
+            num_relations=num_inf_rels * 2, num_time=num_time_t,
+            time_type=inf_time_bi, target_time_type=test_t,
+        )
 
         if self.pre_transform is not None:
             train_data = self.pre_transform(train_data)
