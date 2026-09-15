@@ -503,6 +503,13 @@ class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
     consecutive indices represent close-in-time events.
     """
 
+    @property
+    def processed_dir(self):
+        # Cache under processed_forecast/ so we do not collide with the
+        # older InductiveTemporalDataset-based classes that share `name`
+        # (e.g. YAGOInd, ICEWS18Ind, WIKIInd) but process() differently.
+        return os.path.join(self.root, self.name, "processed_forecast")
+
     def _parse_time(self, s):
         """Parse a timestamp string to something totally-orderable in calendar order.
 
@@ -621,6 +628,11 @@ class MsgAwareForecastDataset(TransductiveTemporalForecastDataset):
     def raw_file_names(self):
         return ["train.txt", "valid.txt", "test.txt", "msg.txt"]
 
+    @property
+    def processed_dir(self):
+        # Different data shape from parent (msg.txt included) -> separate cache.
+        return os.path.join(self.root, self.name, "processed_forecast_msg")
+
     def process(self):
         msg_path = self.raw_paths[3]
         if not os.path.exists(msg_path):
@@ -719,6 +731,21 @@ class TemporalICEWS18(TransductiveTemporalForecastDataset):
 
 class TemporalWIKI(TransductiveTemporalForecastDataset):
     name = "wiki"
+    delimiter = "\t"
+
+# Forecast variants that load from the shipped kg-datasets/<name>/raw dirs
+# (same file layout as YAGOInd / ICEWS18Ind / WIKIInd but with proper
+# train+valid MP prefix + calendar-order time indices).
+class YAGOIndForecast(TransductiveTemporalForecastDataset):
+    name = "YAGOInd"
+    delimiter = "\t"
+
+class ICEWS18IndForecast(TransductiveTemporalForecastDataset):
+    name = "ICEWS18Ind"
+    delimiter = "\t"
+
+class WIKIIndForecast(TransductiveTemporalForecastDataset):
+    name = "WIKIInd"
     delimiter = "\t"
 
 
