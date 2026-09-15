@@ -495,7 +495,41 @@ class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
     TransductiveTemporalDataset uses train only for the test MP graph,
     which is the strictest extrapolation protocol but does not match the
     RE-GCN / RE-Net feedgt=True forecasting benchmarks.
+
+    Also fixes time-index ordering: after loading, all time strings are
+    remapped so integer indices reflect calendar order (via _parse_time).
+    This matters because run.py's rolling loop iterates over sorted
+    unique times, and FITTER's RoPE-style temporal encoding assumes
+    consecutive indices represent close-in-time events.
     """
+
+    def _parse_time(self, s):
+        """Parse a timestamp string to something totally-orderable in calendar order.
+
+        Default: try int, fall back to the string itself. Handles both
+        integer indices ("0", "1", ...) and ISO 8601 dates ("2000-01-05",
+        which sort lexicographically in calendar order). Subclasses can
+        override for other formats (e.g. dd/mm/yyyy).
+        """
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            return s
+
+    def _remap_time_vocab(self, inv_time_vocab, *quad_lists):
+        """Reassign time indices so they sort in calendar order.
+
+        Returns (new_vocab, remapped_quad_lists). Each quad is
+        (u, v, r, t_old) -> (u, v, r, t_new).
+        """
+        sorted_keys = sorted(inv_time_vocab.keys(), key=self._parse_time)
+        new_vocab = {s: i for i, s in enumerate(sorted_keys)}
+        old_to_new = {inv_time_vocab[s]: new_vocab[s] for s in inv_time_vocab}
+        remapped = [
+            [(u, v, r, old_to_new[t]) for (u, v, r, t) in lst]
+            for lst in quad_lists
+        ]
+        return new_vocab, remapped
 
     def process(self):
         train_files = self.raw_paths[:3]
@@ -510,9 +544,13 @@ class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
         num_relations = test_results["num_relation"]
         num_time = test_results["num_time"]
 
-        train_quadruples = train_results["quadruples"]
-        valid_quadruples = valid_results["quadruples"]
-        test_quadruples = test_results["quadruples"]
+        # Calendar-order remap so unique_times.sort() reflects real time.
+        _, (train_quadruples, valid_quadruples, test_quadruples) = self._remap_time_vocab(
+            test_results["inv_time_vocab"],
+            train_results["quadruples"],
+            valid_results["quadruples"],
+            test_results["quadruples"],
+        )
 
         train_target_edges = torch.tensor([[t[0], t[1]] for t in train_quadruples], dtype=torch.long).t()
         train_target_etypes = torch.tensor([t[2] for t in train_quadruples])
@@ -562,6 +600,113 @@ class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
         torch.save((self.collate([train_data, valid_data, test_data])), self.processed_paths[0])
 
 
+class MsgAwareForecastDataset(TransductiveTemporalForecastDataset):
+    """Forecast dataset that also consumes msg.txt as base MP context.
+
+    For the IndT sweep variants (TTRIX-built WIKIIndT_*, GDELTIndT_*,
+    ICEWS*IndT_*) which ship a msg.txt of pre-split history quadruples
+    alongside train/valid/test. The MP graph for each split is built
+    cumulatively:
+
+        train_data.edge_index = msg
+        valid_data.edge_index = msg + train
+        test_data.edge_index  = msg + train + valid  (bidirectional)
+
+    Targets are per-split as usual. Falls back to
+    TransductiveTemporalForecastDataset behavior at process time if
+    msg.txt is missing.
+    """
+
+    @property
+    def raw_file_names(self):
+        return ["train.txt", "valid.txt", "test.txt", "msg.txt"]
+
+    def process(self):
+        msg_path = self.raw_paths[3]
+        if not os.path.exists(msg_path):
+            # Graceful fallback: no msg.txt -> behave like parent class.
+            super().process()
+            return
+
+        # Load msg first so its vocab is included before splits push more.
+        msg_results = self.load_file(msg_path, inv_entity_vocab={}, inv_rel_vocab={}, inv_time_vocab={})
+        train_results = self.load_file(self.raw_paths[0],
+                                       msg_results["inv_entity_vocab"], msg_results["inv_rel_vocab"], msg_results['inv_time_vocab'])
+        valid_results = self.load_file(self.raw_paths[1],
+                                       train_results["inv_entity_vocab"], train_results["inv_rel_vocab"], train_results['inv_time_vocab'])
+        test_results = self.load_file(self.raw_paths[2],
+                                      valid_results["inv_entity_vocab"], valid_results["inv_rel_vocab"], valid_results['inv_time_vocab'])
+
+        num_node = test_results["num_node"]
+        num_relations = test_results["num_relation"]
+        num_time = test_results["num_time"]
+
+        _, (msg_quadruples, train_quadruples, valid_quadruples, test_quadruples) = self._remap_time_vocab(
+            test_results["inv_time_vocab"],
+            msg_results["quadruples"],
+            train_results["quadruples"],
+            valid_results["quadruples"],
+            test_results["quadruples"],
+        )
+
+        def _quads_to_tensors(quads):
+            if not quads:
+                empty2 = torch.empty(2, 0, dtype=torch.long)
+                empty1 = torch.empty(0, dtype=torch.long)
+                return empty2, empty1, empty1
+            ei = torch.tensor([[q[0], q[1]] for q in quads], dtype=torch.long).t()
+            et = torch.tensor([q[2] for q in quads], dtype=torch.long)
+            tt = torch.tensor([q[3] for q in quads], dtype=torch.long)
+            return ei, et, tt
+
+        msg_ei, msg_et, msg_tt = _quads_to_tensors(msg_quadruples)
+        tr_ei, tr_et, tr_tt = _quads_to_tensors(train_quadruples)
+        va_ei, va_et, va_tt = _quads_to_tensors(valid_quadruples)
+        te_ei, te_et, te_tt = _quads_to_tensors(test_quadruples)
+
+        def _bi(ei, et, tt):
+            ei_bi = torch.cat([ei, ei.flip(0)], dim=1)
+            et_bi = torch.cat([et, et + num_relations])
+            tt_bi = torch.cat([tt, tt])
+            return ei_bi, et_bi, tt_bi
+
+        # Cumulative MP graphs
+        msg_ei_fwd = msg_ei
+        msg_et_fwd = msg_et
+        msg_tt_fwd = msg_tt
+        msg_ei_bi, msg_et_bi, msg_tt_bi = _bi(msg_ei_fwd, msg_et_fwd, msg_tt_fwd)
+
+        msg_tr_ei_fwd = torch.cat([msg_ei_fwd, tr_ei], dim=1)
+        msg_tr_et_fwd = torch.cat([msg_et_fwd, tr_et])
+        msg_tr_tt_fwd = torch.cat([msg_tt_fwd, tr_tt])
+        msg_tr_ei_bi, msg_tr_et_bi, msg_tr_tt_bi = _bi(msg_tr_ei_fwd, msg_tr_et_fwd, msg_tr_tt_fwd)
+
+        msg_tr_va_ei_fwd = torch.cat([msg_tr_ei_fwd, va_ei], dim=1)
+        msg_tr_va_et_fwd = torch.cat([msg_tr_et_fwd, va_et])
+        msg_tr_va_tt_fwd = torch.cat([msg_tr_tt_fwd, va_tt])
+        msg_tr_va_ei_bi, msg_tr_va_et_bi, msg_tr_va_tt_bi = _bi(msg_tr_va_ei_fwd, msg_tr_va_et_fwd, msg_tr_va_tt_fwd)
+
+        train_data = Data(edge_index=msg_ei_bi, edge_type=msg_et_bi, num_nodes=num_node,
+                          target_edge_index=tr_ei, target_edge_type=tr_et,
+                          num_relations=num_relations * 2, num_time=num_time,
+                          time_type=msg_tt_bi, target_time_type=tr_tt)
+        valid_data = Data(edge_index=msg_tr_ei_bi, edge_type=msg_tr_et_bi, num_nodes=num_node,
+                          target_edge_index=va_ei, target_edge_type=va_et,
+                          num_relations=num_relations * 2, num_time=num_time,
+                          time_type=msg_tr_tt_bi, target_time_type=va_tt)
+        test_data = Data(edge_index=msg_tr_va_ei_bi, edge_type=msg_tr_va_et_bi, num_nodes=num_node,
+                         target_edge_index=te_ei, target_edge_type=te_et,
+                         num_relations=num_relations * 2, num_time=num_time,
+                         time_type=msg_tr_va_tt_bi, target_time_type=te_tt)
+
+        if self.pre_transform is not None:
+            train_data = self.pre_transform(train_data)
+            valid_data = self.pre_transform(valid_data)
+            test_data = self.pre_transform(test_data)
+
+        torch.save((self.collate([train_data, valid_data, test_data])), self.processed_paths[0])
+
+
 # --- Chronological-split base datasets ------------------------------------
 
 class TemporalYAGO(TransductiveTemporalForecastDataset):
@@ -579,81 +724,81 @@ class TemporalWIKI(TransductiveTemporalForecastDataset):
 
 # --- IndT sweep variants (built from TTRIX's dataset construction) --------
 
-class WIKIIndT_25_inter(TransductiveTemporalForecastDataset):
+class WIKIIndT_25_inter(MsgAwareForecastDataset):
     name = "WIKIIndT_25_inter"
     delimiter = "\t"
 
-class WIKIIndT_25_extra(TransductiveTemporalForecastDataset):
+class WIKIIndT_25_extra(MsgAwareForecastDataset):
     name = "WIKIIndT_25_extra"
     delimiter = "\t"
 
-class WIKIIndT_50_inter(TransductiveTemporalForecastDataset):
+class WIKIIndT_50_inter(MsgAwareForecastDataset):
     name = "WIKIIndT_50_inter"
     delimiter = "\t"
 
-class WIKIIndT_50_extra(TransductiveTemporalForecastDataset):
+class WIKIIndT_50_extra(MsgAwareForecastDataset):
     name = "WIKIIndT_50_extra"
     delimiter = "\t"
 
-class WIKIIndT_75_inter(TransductiveTemporalForecastDataset):
+class WIKIIndT_75_inter(MsgAwareForecastDataset):
     name = "WIKIIndT_75_inter"
     delimiter = "\t"
 
-class WIKIIndT_75_extra(TransductiveTemporalForecastDataset):
+class WIKIIndT_75_extra(MsgAwareForecastDataset):
     name = "WIKIIndT_75_extra"
     delimiter = "\t"
 
-class WIKIIndT_100_inter(TransductiveTemporalForecastDataset):
+class WIKIIndT_100_inter(MsgAwareForecastDataset):
     name = "WIKIIndT_100_inter"
     delimiter = "\t"
 
-class WIKIIndT_100_extra(TransductiveTemporalForecastDataset):
+class WIKIIndT_100_extra(MsgAwareForecastDataset):
     name = "WIKIIndT_100_extra"
     delimiter = "\t"
 
 
-class GDELTIndT_25_inter(TransductiveTemporalForecastDataset):
+class GDELTIndT_25_inter(MsgAwareForecastDataset):
     name = "GDELTIndT_25_inter"
     delimiter = "\t"
 
-class GDELTIndT_25_extra(TransductiveTemporalForecastDataset):
+class GDELTIndT_25_extra(MsgAwareForecastDataset):
     name = "GDELTIndT_25_extra"
     delimiter = "\t"
 
-class GDELTIndT_50_inter(TransductiveTemporalForecastDataset):
+class GDELTIndT_50_inter(MsgAwareForecastDataset):
     name = "GDELTIndT_50_inter"
     delimiter = "\t"
 
-class GDELTIndT_50_extra(TransductiveTemporalForecastDataset):
+class GDELTIndT_50_extra(MsgAwareForecastDataset):
     name = "GDELTIndT_50_extra"
     delimiter = "\t"
 
-class GDELTIndT_75_inter(TransductiveTemporalForecastDataset):
+class GDELTIndT_75_inter(MsgAwareForecastDataset):
     name = "GDELTIndT_75_inter"
     delimiter = "\t"
 
-class GDELTIndT_75_extra(TransductiveTemporalForecastDataset):
+class GDELTIndT_75_extra(MsgAwareForecastDataset):
     name = "GDELTIndT_75_extra"
     delimiter = "\t"
 
-class GDELTIndT_100_inter(TransductiveTemporalForecastDataset):
+class GDELTIndT_100_inter(MsgAwareForecastDataset):
     name = "GDELTIndT_100_inter"
     delimiter = "\t"
 
-class GDELTIndT_100_extra(TransductiveTemporalForecastDataset):
+class GDELTIndT_100_extra(MsgAwareForecastDataset):
     name = "GDELTIndT_100_extra"
     delimiter = "\t"
 
-class GDELTIndT_100(TransductiveTemporalForecastDataset):
+class GDELTIndT_100(MsgAwareForecastDataset):
     name = "GDELTIndT_100"
     delimiter = "\t"
 
 
-class ICEWS14IndT_100(TransductiveTemporalForecastDataset):
+class ICEWS14IndT_100(MsgAwareForecastDataset):
     name = "ICEWS14IndT_100"
     delimiter = "\t"
 
-class ICEWS0515IndT_100(TransductiveTemporalForecastDataset):
+class ICEWS0515IndT_100(MsgAwareForecastDataset):
     name = "ICEWS0515IndT_100"
     delimiter = "\t"
 
