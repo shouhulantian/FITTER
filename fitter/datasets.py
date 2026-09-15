@@ -160,15 +160,14 @@ class TransductiveTemporalDataset(InMemoryDataset):
                 if t_instance[3] not in inv_time_vocab:
                     inv_time_vocab[t_instance[3]] = time_cnt
                     time_cnt += 1
-                if len(t_instance) == 5 and t_instance[4] not in inv_time_vocab:
-                    inv_time_vocab[t_instance[4]] = time_cnt
-                    time_cnt += 1
-                if len(t_instance) == 4:
-                    u, r, v, t1 = inv_entity_vocab[t_instance[0]], inv_rel_vocab[t_instance[1]], inv_entity_vocab[t_instance[2]], inv_time_vocab[t_instance[3]]
-                    quadruples.append((u, v, r, t1))
-                else:
-                    u, r, v, t1, t2 = inv_entity_vocab[t_instance[0]], inv_rel_vocab[t_instance[1]],inv_entity_vocab[t_instance[2]], inv_time_vocab[t_instance[3]], inv_time_vocab[t_instance[4]]
-                    quadruples.append((u, v, r, t1, t2))
+                # For interval-valued datasets (5 cols: u r v t_start t_end)
+                # the 5th column carries no signal used downstream and is
+                # dropped at parse time — every row is stored as a 4-tuple.
+                u = inv_entity_vocab[t_instance[0]]
+                r = inv_rel_vocab[t_instance[1]]
+                v = inv_entity_vocab[t_instance[2]]
+                t1 = inv_time_vocab[t_instance[3]]
+                quadruples.append((u, v, r, t1))
 
         return {
             "quadruples": quadruples,
@@ -306,15 +305,14 @@ class InductiveTemporalDataset(InMemoryDataset):
                 if t_instance[3] not in inv_time_vocab:
                     inv_time_vocab[t_instance[3]] = time_cnt
                     time_cnt += 1
-                if len(t_instance) == 5 and t_instance[4] not in inv_time_vocab:
-                    inv_time_vocab[t_instance[4]] = time_cnt
-                    time_cnt += 1
-                if len(t_instance) == 4:
-                    u, r, v, t1 = inv_entity_vocab[t_instance[0]], inv_rel_vocab[t_instance[1]], inv_entity_vocab[t_instance[2]], inv_time_vocab[t_instance[3]]
-                    quadruples.append((u, v, r, t1))
-                else:
-                    u, r, v, t1, t2 = inv_entity_vocab[t_instance[0]], inv_rel_vocab[t_instance[1]],inv_entity_vocab[t_instance[2]], inv_time_vocab[t_instance[3]], inv_time_vocab[t_instance[4]]
-                    quadruples.append((u, v, r, t1, t2))
+                # For interval-valued datasets (5 cols: u r v t_start t_end)
+                # the 5th column carries no signal used downstream and is
+                # dropped at parse time — every row is stored as a 4-tuple.
+                u = inv_entity_vocab[t_instance[0]]
+                r = inv_rel_vocab[t_instance[1]]
+                v = inv_entity_vocab[t_instance[2]]
+                t1 = inv_time_vocab[t_instance[3]]
+                quadruples.append((u, v, r, t1))
 
         return {
             "quadruples": quadruples,
