@@ -1,0 +1,62 @@
+# Per-query rank-dump eval config: FITTER (any source ckpt) on YAGOInd.
+#
+# Mirrors inf_YAGO.yaml exactly (architecture must match the released ckpts).
+# Differences from inf_YAGO.yaml:
+#   - output_dir   -> absolute path (no ~ expansion)
+#   - dataset.root -> absolute path to bundled kg-datasets/
+#
+# Used by script/run_dump_ranks.py for the §2 rebuttal Strict Recurrency
+# breakdown on YAGO test (FITTER trained on ICEWS14 vs trained on GDELT).
+
+output_dir: {{ output_dir }}
+
+dataset:
+  class: {{ dataset }}
+  root: /mnt/nfs/home/ac139229/git/Ultra/ultra/FITTER/source_code/kg-datasets/
+
+model:
+  class: FITTER
+  relation_model:
+    class: NBFNet
+    input_dim: 64
+    hidden_dims: [64,64,64,64,64,64]
+    message_func: dual
+    aggregate_func: sum
+    short_cut: yes
+    layer_norm: yes
+    time_graph: default
+    window_size: 1
+  entity_model:
+    class: IndNBFNet
+    input_dim: 64
+    hidden_dims: [64,64,64,64,64,64]
+    message_func: tcomplx
+    aggregate_func: sum
+    short_cut: yes
+    layer_norm: yes
+    use_time: nbf_concat
+    remove_edge: default
+    boundary: default
+    project_times: True
+    time_dependent: False
+    alpha: 1
+
+task:
+  name: TransductiveInference
+  num_negative: 512
+  strict_negative: yes
+  adversarial_temperature: 1
+  metric: [mr, mrr, hits@1, hits@3, hits@10]
+
+optimizer:
+  class: AdamW
+  lr: 5.0e-4
+
+train:
+  gpus: {{ gpus }}
+  batch_size: 16
+  num_epoch: {{ epochs }}
+  log_interval: 100
+  batch_per_epoch: {{ bpe }}
+
+checkpoint: {{ ckpt }}

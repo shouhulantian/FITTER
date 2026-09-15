@@ -25,3 +25,6 @@ model_epoch_*.pth
 
 # Processed dataset caches (keep raw/ only)
 kg-datasets/**/processed/
+
+# Cluster-specific sbatch stdout logs
+ac139229_job_*.out
