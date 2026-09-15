@@ -484,6 +484,180 @@ class WIKIInd(InductiveTemporalDataset):
     name = "WIKIInd"
     delimiter = "\t"
 
+
+class TransductiveTemporalForecastDataset(TransductiveTemporalDataset):
+    """Chronological-split temporal KG datasets (YAGO, ICEWS18, WIKI + IndT sweeps).
+
+    Mirrors TTRIX's _TemporalForecastDataset: test_data.edge_index is
+    train + valid bidirectional (with inverse-relation offsets), giving
+    the rolling forecaster in run.py's test_time_single_step a base
+    context that includes all validation history. The base
+    TransductiveTemporalDataset uses train only for the test MP graph,
+    which is the strictest extrapolation protocol but does not match the
+    RE-GCN / RE-Net feedgt=True forecasting benchmarks.
+    """
+
+    def process(self):
+        train_files = self.raw_paths[:3]
+
+        train_results = self.load_file(train_files[0], inv_entity_vocab={}, inv_rel_vocab={}, inv_time_vocab={})
+        valid_results = self.load_file(train_files[1],
+                                       train_results["inv_entity_vocab"], train_results["inv_rel_vocab"], train_results['inv_time_vocab'])
+        test_results = self.load_file(train_files[2],
+                                      valid_results["inv_entity_vocab"], valid_results["inv_rel_vocab"], valid_results['inv_time_vocab'])
+
+        num_node = test_results["num_node"]
+        num_relations = test_results["num_relation"]
+        num_time = test_results["num_time"]
+
+        train_quadruples = train_results["quadruples"]
+        valid_quadruples = valid_results["quadruples"]
+        test_quadruples = test_results["quadruples"]
+
+        train_target_edges = torch.tensor([[t[0], t[1]] for t in train_quadruples], dtype=torch.long).t()
+        train_target_etypes = torch.tensor([t[2] for t in train_quadruples])
+        train_target_ttypes = torch.tensor([t[3] for t in train_quadruples])
+
+        valid_edges = torch.tensor([[t[0], t[1]] for t in valid_quadruples], dtype=torch.long).t()
+        valid_etypes = torch.tensor([t[2] for t in valid_quadruples])
+        valid_ttypes = torch.tensor([t[3] for t in valid_quadruples])
+
+        test_edges = torch.tensor([[t[0], t[1]] for t in test_quadruples], dtype=torch.long).t()
+        test_etypes = torch.tensor([t[2] for t in test_quadruples])
+        test_ttypes = torch.tensor([t[3] for t in test_quadruples])
+
+        # Train MP graph = train only (bidirectional + inverse offsets)
+        train_edges_bi = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
+        train_etypes_bi = torch.cat([train_target_etypes, train_target_etypes + num_relations])
+        train_ttypes_bi = torch.cat([train_target_ttypes, train_target_ttypes])
+
+        # Test MP graph = train + valid (feedgt=True forecast baseline)
+        trainval_edges_fwd = torch.cat([train_target_edges, valid_edges], dim=1)
+        trainval_etypes_fwd = torch.cat([train_target_etypes, valid_etypes])
+        trainval_ttypes_fwd = torch.cat([train_target_ttypes, valid_ttypes])
+        trainval_edges_bi = torch.cat([trainval_edges_fwd, trainval_edges_fwd.flip(0)], dim=1)
+        trainval_etypes_bi = torch.cat([trainval_etypes_fwd, trainval_etypes_fwd + num_relations])
+        trainval_ttypes_bi = torch.cat([trainval_ttypes_fwd, trainval_ttypes_fwd])
+
+        train_data = Data(edge_index=train_edges_bi, edge_type=train_etypes_bi, num_nodes=num_node,
+                          target_edge_index=train_target_edges, target_edge_type=train_target_etypes,
+                          num_relations=num_relations * 2, num_time=num_time,
+                          time_type=train_ttypes_bi, target_time_type=train_target_ttypes)
+        # Valid: MP graph = train only, targets = valid edges
+        valid_data = Data(edge_index=train_edges_bi, edge_type=train_etypes_bi, num_nodes=num_node,
+                          target_edge_index=valid_edges, target_edge_type=valid_etypes,
+                          num_relations=num_relations * 2, num_time=num_time,
+                          time_type=train_ttypes_bi, target_time_type=valid_ttypes)
+        # Test: MP graph = train + valid, targets = test edges
+        test_data = Data(edge_index=trainval_edges_bi, edge_type=trainval_etypes_bi, num_nodes=num_node,
+                         target_edge_index=test_edges, target_edge_type=test_etypes,
+                         num_relations=num_relations * 2, num_time=num_time,
+                         time_type=trainval_ttypes_bi, target_time_type=test_ttypes)
+
+        if self.pre_transform is not None:
+            train_data = self.pre_transform(train_data)
+            valid_data = self.pre_transform(valid_data)
+            test_data = self.pre_transform(test_data)
+
+        torch.save((self.collate([train_data, valid_data, test_data])), self.processed_paths[0])
+
+
+# --- Chronological-split base datasets ------------------------------------
+
+class TemporalYAGO(TransductiveTemporalForecastDataset):
+    name = "yago"
+    delimiter = "\t"
+
+class TemporalICEWS18(TransductiveTemporalForecastDataset):
+    name = "icews18"
+    delimiter = "\t"
+
+class TemporalWIKI(TransductiveTemporalForecastDataset):
+    name = "wiki"
+    delimiter = "\t"
+
+
+# --- IndT sweep variants (built from TTRIX's dataset construction) --------
+
+class WIKIIndT_25_inter(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_25_inter"
+    delimiter = "\t"
+
+class WIKIIndT_25_extra(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_25_extra"
+    delimiter = "\t"
+
+class WIKIIndT_50_inter(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_50_inter"
+    delimiter = "\t"
+
+class WIKIIndT_50_extra(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_50_extra"
+    delimiter = "\t"
+
+class WIKIIndT_75_inter(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_75_inter"
+    delimiter = "\t"
+
+class WIKIIndT_75_extra(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_75_extra"
+    delimiter = "\t"
+
+class WIKIIndT_100_inter(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_100_inter"
+    delimiter = "\t"
+
+class WIKIIndT_100_extra(TransductiveTemporalForecastDataset):
+    name = "WIKIIndT_100_extra"
+    delimiter = "\t"
+
+
+class GDELTIndT_25_inter(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_25_inter"
+    delimiter = "\t"
+
+class GDELTIndT_25_extra(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_25_extra"
+    delimiter = "\t"
+
+class GDELTIndT_50_inter(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_50_inter"
+    delimiter = "\t"
+
+class GDELTIndT_50_extra(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_50_extra"
+    delimiter = "\t"
+
+class GDELTIndT_75_inter(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_75_inter"
+    delimiter = "\t"
+
+class GDELTIndT_75_extra(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_75_extra"
+    delimiter = "\t"
+
+class GDELTIndT_100_inter(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_100_inter"
+    delimiter = "\t"
+
+class GDELTIndT_100_extra(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_100_extra"
+    delimiter = "\t"
+
+class GDELTIndT_100(TransductiveTemporalForecastDataset):
+    name = "GDELTIndT_100"
+    delimiter = "\t"
+
+
+class ICEWS14IndT_100(TransductiveTemporalForecastDataset):
+    name = "ICEWS14IndT_100"
+    delimiter = "\t"
+
+class ICEWS0515IndT_100(TransductiveTemporalForecastDataset):
+    name = "ICEWS0515IndT_100"
+    delimiter = "\t"
+
+
 class InductiveDataset(InMemoryDataset):
 
     delimiter = None
