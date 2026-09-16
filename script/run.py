@@ -566,11 +566,32 @@ if __name__ == "__main__":
     else:
         # for transductive setting, use the whole graph for filtered ranking
         if 'time_type' in dataset._data.keys():
-            filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes,time_type=dataset._data.target_time_type)
+            # Disjoint-vocab detection: MsgAwareForecastDataset gives test its
+            # own G_inf vocab (num_nodes differs from train). Collating all
+            # splits' targets would mix G_tr / G_inf ids. Build per-split
+            # filters that stay within each vocab.
+            train_n = int(train_data.num_nodes) if not isinstance(train_data.num_nodes, torch.Tensor) else int(train_data.num_nodes.item())
+            test_n = int(test_data.num_nodes) if not isinstance(test_data.num_nodes, torch.Tensor) else int(test_data.num_nodes.item())
+            if test_n != train_n:
+                val_filtered_data = Data(
+                    edge_index=valid_data.target_edge_index,
+                    edge_type=valid_data.target_edge_type,
+                    num_nodes=valid_data.num_nodes,
+                    time_type=valid_data.target_time_type,
+                )
+                test_filtered_data = Data(
+                    edge_index=test_data.target_edge_index,
+                    edge_type=test_data.target_edge_type,
+                    num_nodes=test_data.num_nodes,
+                    time_type=test_data.target_time_type,
+                )
+            else:
+                filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes,time_type=dataset._data.target_time_type)
+                val_filtered_data = test_filtered_data = filtered_data
         else:
             filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type,
                                  num_nodes=dataset[0].num_nodes)
-        val_filtered_data = test_filtered_data = filtered_data
+            val_filtered_data = test_filtered_data = filtered_data
     
     val_filtered_data = val_filtered_data.to(device)
     test_filtered_data = test_filtered_data.to(device)
