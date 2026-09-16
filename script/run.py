@@ -586,18 +586,34 @@ if __name__ == "__main__":
             train_n = int(train_data.num_nodes) if not isinstance(train_data.num_nodes, torch.Tensor) else int(train_data.num_nodes.item())
             test_n = int(test_data.num_nodes) if not isinstance(test_data.num_nodes, torch.Tensor) else int(test_data.num_nodes.item())
             if test_n != train_n:
-                val_filtered_data = Data(
-                    edge_index=valid_data.target_edge_index,
-                    edge_type=valid_data.target_edge_type,
-                    num_nodes=valid_data.num_nodes,
-                    time_type=valid_data.target_time_type,
-                )
-                test_filtered_data = Data(
-                    edge_index=test_data.target_edge_index,
-                    edge_type=test_data.target_edge_type,
-                    num_nodes=test_data.num_nodes,
-                    time_type=test_data.target_time_type,
-                )
+                # strict_negative_time_mask builds keys from
+                # <data>.target_edge_index bidirectional and looks up
+                # <data>.edge_index[1, edge_id] at the matching positions.
+                # For positions to align, edge_index must be the
+                # bidirectional layout of target_edge_index. Build the
+                # filter Data so both sides live in the same vocab AND
+                # share position indexing.
+                def _build_filter(d):
+                    n_rt = int(d.num_relations) if not isinstance(d.num_relations, torch.Tensor) else int(d.num_relations.item())
+                    n_orig = n_rt // 2
+                    tei = d.target_edge_index
+                    tet = d.target_edge_type
+                    ttt = d.target_time_type
+                    ei_bi = torch.cat([tei, tei.flip(0)], dim=1)
+                    et_bi = torch.cat([tet, tet + n_orig])
+                    tt_bi = torch.cat([ttt, ttt])
+                    return Data(
+                        edge_index=ei_bi,
+                        edge_type=et_bi,
+                        time_type=tt_bi,
+                        target_edge_index=tei,
+                        target_edge_type=tet,
+                        target_time_type=ttt,
+                        num_nodes=d.num_nodes,
+                        num_relations=n_rt,
+                    )
+                val_filtered_data = _build_filter(valid_data)
+                test_filtered_data = _build_filter(test_data)
             else:
                 filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes,time_type=dataset._data.target_time_type)
                 val_filtered_data = test_filtered_data = filtered_data
