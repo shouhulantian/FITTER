@@ -353,23 +353,19 @@ def test_time_single_step(cfg, model, test_data, device, logger, filtered_data=N
             t_pred = model(ts_data, t_batch)
             h_pred = model(ts_data, h_batch)
 
-            # For disjoint-vocab datasets (MsgAwareForecastDataset), train_data
-            # is on G_tr while ts_data / filtered_data are on G_inf; the
-            # strict_negative_time_mask internal edge_id lookup would index
-            # G_inf edges with positions from G_tr, giving out-of-bounds or
-            # silently wrong entities. Pass train_data=None so the mask
-            # function defaults to using the vocab-consistent `data` arg.
-            _tr = train_data
-            if train_data is not None:
-                tr_n = int(train_data.num_nodes) if not isinstance(train_data.num_nodes, torch.Tensor) else int(train_data.num_nodes.item())
-                ts_n = int(ts_data.num_nodes) if not isinstance(ts_data.num_nodes, torch.Tensor) else int(ts_data.num_nodes.item())
-                if tr_n != ts_n:
-                    _tr = None
-
+            # Always pass train_data=None so strict_negative_time_mask
+            # defaults to using `data` (either filtered_data or ts_data) as
+            # both key-source and value-source. Passing a separate train_data
+            # only works when train_data.target_edge_index positions align
+            # with data.edge_index — an invariant that breaks under
+            # disjoint-vocab layouts AND under any filter whose edge_index
+            # isn't the bidirectional layout of train_data's targets. The
+            # filter Data built in __main__ has both target_edge_index and
+            # a matching bidirectional edge_index, so it's self-consistent.
             if filtered_data is None:
-                t_mask, h_mask = tasks.strict_negative_time_mask(ts_data, batch, _tr)
+                t_mask, h_mask = tasks.strict_negative_time_mask(ts_data, batch, None)
             else:
-                t_mask, h_mask = tasks.strict_negative_time_mask(filtered_data, batch, _tr)
+                t_mask, h_mask = tasks.strict_negative_time_mask(filtered_data, batch, None)
 
             pos_h_index, pos_t_index, pos_r_index, pos_time_index = batch.t()
             t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
@@ -577,46 +573,38 @@ if __name__ == "__main__":
                 edge_type=torch.cat([train_data.edge_type, valid_data.target_edge_type])
             )
     else:
-        # for transductive setting, use the whole graph for filtered ranking
+        # For temporal datasets, always build a self-consistent per-split
+        # filter via _build_filter: edge_index is the bidirectional layout of
+        # target_edge_index, and target_edge_* attrs are set. This is the
+        # invariant strict_negative_time_mask needs — its internal
+        # train_edges keys (bidir of target_edge_index) share position
+        # indexing with data.edge_index so its edge_id lookup is valid. For
+        # chronological / forecasting splits (train/valid/test all have
+        # disjoint times) this filter is equivalent to a collated-across-
+        # splits filter under time-aware matching (only same-tau matches
+        # count), so semantically equivalent for our use cases.
         if 'time_type' in dataset._data.keys():
-            # Disjoint-vocab detection: MsgAwareForecastDataset gives test its
-            # own G_inf vocab (num_nodes differs from train). Collating all
-            # splits' targets would mix G_tr / G_inf ids. Build per-split
-            # filters that stay within each vocab.
-            train_n = int(train_data.num_nodes) if not isinstance(train_data.num_nodes, torch.Tensor) else int(train_data.num_nodes.item())
-            test_n = int(test_data.num_nodes) if not isinstance(test_data.num_nodes, torch.Tensor) else int(test_data.num_nodes.item())
-            if test_n != train_n:
-                # strict_negative_time_mask builds keys from
-                # <data>.target_edge_index bidirectional and looks up
-                # <data>.edge_index[1, edge_id] at the matching positions.
-                # For positions to align, edge_index must be the
-                # bidirectional layout of target_edge_index. Build the
-                # filter Data so both sides live in the same vocab AND
-                # share position indexing.
-                def _build_filter(d):
-                    n_rt = int(d.num_relations) if not isinstance(d.num_relations, torch.Tensor) else int(d.num_relations.item())
-                    n_orig = n_rt // 2
-                    tei = d.target_edge_index
-                    tet = d.target_edge_type
-                    ttt = d.target_time_type
-                    ei_bi = torch.cat([tei, tei.flip(0)], dim=1)
-                    et_bi = torch.cat([tet, tet + n_orig])
-                    tt_bi = torch.cat([ttt, ttt])
-                    return Data(
-                        edge_index=ei_bi,
-                        edge_type=et_bi,
-                        time_type=tt_bi,
-                        target_edge_index=tei,
-                        target_edge_type=tet,
-                        target_time_type=ttt,
-                        num_nodes=d.num_nodes,
-                        num_relations=n_rt,
-                    )
-                val_filtered_data = _build_filter(valid_data)
-                test_filtered_data = _build_filter(test_data)
-            else:
-                filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type, num_nodes=dataset[0].num_nodes,time_type=dataset._data.target_time_type)
-                val_filtered_data = test_filtered_data = filtered_data
+            def _build_filter(d):
+                n_rt = int(d.num_relations) if not isinstance(d.num_relations, torch.Tensor) else int(d.num_relations.item())
+                n_orig = n_rt // 2
+                tei = d.target_edge_index
+                tet = d.target_edge_type
+                ttt = d.target_time_type
+                ei_bi = torch.cat([tei, tei.flip(0)], dim=1)
+                et_bi = torch.cat([tet, tet + n_orig])
+                tt_bi = torch.cat([ttt, ttt])
+                return Data(
+                    edge_index=ei_bi,
+                    edge_type=et_bi,
+                    time_type=tt_bi,
+                    target_edge_index=tei,
+                    target_edge_type=tet,
+                    target_time_type=ttt,
+                    num_nodes=d.num_nodes,
+                    num_relations=n_rt,
+                )
+            val_filtered_data = _build_filter(valid_data)
+            test_filtered_data = _build_filter(test_data)
         else:
             filtered_data = Data(edge_index=dataset._data.target_edge_index, edge_type=dataset._data.target_edge_type,
                                  num_nodes=dataset[0].num_nodes)
