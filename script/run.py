@@ -353,10 +353,23 @@ def test_time_single_step(cfg, model, test_data, device, logger, filtered_data=N
             t_pred = model(ts_data, t_batch)
             h_pred = model(ts_data, h_batch)
 
+            # For disjoint-vocab datasets (MsgAwareForecastDataset), train_data
+            # is on G_tr while ts_data / filtered_data are on G_inf; the
+            # strict_negative_time_mask internal edge_id lookup would index
+            # G_inf edges with positions from G_tr, giving out-of-bounds or
+            # silently wrong entities. Pass train_data=None so the mask
+            # function defaults to using the vocab-consistent `data` arg.
+            _tr = train_data
+            if train_data is not None:
+                tr_n = int(train_data.num_nodes) if not isinstance(train_data.num_nodes, torch.Tensor) else int(train_data.num_nodes.item())
+                ts_n = int(ts_data.num_nodes) if not isinstance(ts_data.num_nodes, torch.Tensor) else int(ts_data.num_nodes.item())
+                if tr_n != ts_n:
+                    _tr = None
+
             if filtered_data is None:
-                t_mask, h_mask = tasks.strict_negative_time_mask(ts_data, batch, train_data)
+                t_mask, h_mask = tasks.strict_negative_time_mask(ts_data, batch, _tr)
             else:
-                t_mask, h_mask = tasks.strict_negative_time_mask(filtered_data, batch, train_data)
+                t_mask, h_mask = tasks.strict_negative_time_mask(filtered_data, batch, _tr)
 
             pos_h_index, pos_t_index, pos_r_index, pos_time_index = batch.t()
             t_ranking = tasks.compute_ranking(t_pred, pos_t_index, t_mask)
