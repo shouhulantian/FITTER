@@ -160,46 +160,39 @@ def strict_negative_mask(data, batch):
     return t_mask, h_mask
 
 def strict_negative_time_mask(data, batch, train_data=None):
-    # this function makes sure that for a given (h, r) batch we will NOT sample true tails as random negatives
-    # similarly, for a given (t, r) we will NOT sample existing true heads as random negatives
-    if train_data is None:
-        train_data = data
+    """Time-aware filtered ranking.
+
+    For a query (h, r, ?, tau), filter out any tail t' such that
+    (h, r, t', tau) exists in the filter graph. Filter keys are built
+    from data.edge_index directly, so whatever edges are packed into
+    filtered_data (typically train + valid + test target quadruples,
+    plus the message-passing graph) all participate as known facts.
+
+    The `train_data` argument is deprecated / ignored. Previously the
+    function built filter keys from train_data.target_edge_index only,
+    which under-filtered on valid- and test-known facts (competitors
+    that should have been removed remained in the negative pool,
+    depressing filtered MRR).
+    """
     pos_h_index, pos_t_index, pos_r_index, pos_time_index = batch.t()
 
-    # part I: sample hard negative tails
-    # edge index of all (head, relation) edges from the underlying graph
-    train_edges = torch.cat([train_data.target_edge_index, train_data.target_edge_index.flip(0)], dim=1)
-    train_etypes = torch.cat([train_data.target_edge_type, train_data.target_edge_type + int(train_data.num_relations)])
-    train_ttypes = torch.cat([train_data.target_time_type,train_data.target_time_type ])
-    edge_index = torch.stack([train_edges[0], train_etypes, train_ttypes])
-    ##previous one without Compact Dataset
-    #edge_index = torch.stack([data.edge_index[0], data.edge_type,data.time_type])
-    # edge index of current batch (head, relation) for which we will sample negatives
-    query_index = torch.stack([pos_h_index, pos_r_index,pos_time_index])
-    # search for all true tails for the given (h, r) batch
+    # Part I: negative tails — filter t' such that (h, r, t', tau) is a known fact.
+    edge_index = torch.stack([data.edge_index[0], data.edge_type, data.time_type])
+    query_index = torch.stack([pos_h_index, pos_r_index, pos_time_index])
     edge_id, num_t_truth = edge_match(edge_index, query_index)
-    # build an index from the found edges
     t_truth_index = data.edge_index[1, edge_id]
     sample_id = torch.arange(len(num_t_truth), device=batch.device).repeat_interleave(num_t_truth)
     t_mask = torch.ones(len(num_t_truth), data.num_nodes, dtype=torch.bool, device=batch.device)
-    # assign 0s to the mask with the found true tails
     t_mask[sample_id, t_truth_index] = 0
     t_mask.scatter_(1, pos_t_index.unsqueeze(-1), 0)
 
-    # part II: sample hard negative heads
-    # edge_index[1] denotes tails, so the edge index becomes (t, r)
-    edge_index = torch.stack([train_edges[1], train_etypes, train_ttypes])
-    ##previous one without Compact Dataset
-    #edge_index = torch.stack([data.edge_index[1], data.edge_type,data.time_type])
-    # edge index of current batch (tail, relation) for which we will sample heads
-    query_index = torch.stack([pos_t_index, pos_r_index,pos_time_index])
-    # search for all true heads for the given (t, r) batch
+    # Part II: negative heads — filter h' such that (h', r, t, tau) is a known fact.
+    edge_index = torch.stack([data.edge_index[1], data.edge_type, data.time_type])
+    query_index = torch.stack([pos_t_index, pos_r_index, pos_time_index])
     edge_id, num_h_truth = edge_match(edge_index, query_index)
-    # build an index from the found edges
     h_truth_index = data.edge_index[0, edge_id]
     sample_id = torch.arange(len(num_h_truth), device=batch.device).repeat_interleave(num_h_truth)
     h_mask = torch.ones(len(num_h_truth), data.num_nodes, dtype=torch.bool, device=batch.device)
-    # assign 0s to the mask with the found true heads
     h_mask[sample_id, h_truth_index] = 0
     h_mask.scatter_(1, pos_h_index.unsqueeze(-1), 0)
 
